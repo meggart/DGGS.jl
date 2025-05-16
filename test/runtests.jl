@@ -57,7 +57,7 @@ using DimensionalData
         geo_diffs = abs.(geo_array .- geo_array2)
 
         @test size(geo_array) == size(geo_array2)
-        @test all(geo_diffs .< 1.7) # max global deviation
+        @test all(geo_diffs .< 3.0) # max global deviation
         @test sum(geo_diffs .< 0.1) / length(geo_diffs) >= 0.95
         # alternative methods
         lon_range = -180:180

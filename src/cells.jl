@@ -6,15 +6,24 @@ using StaticArrays
 
 const n_submats = 5
 const crs_geo = "EPSG:4326"
-const crs_isea = "+proj=isea +orient=isea +mode=plane +R=6371007.18091875"
+const crs_isea = "+proj=isea +orient=pole +mode=plane +R=6371007.18091875"
+const rect_width = 4.6040891604444e7
+const rect_height = 3.3233774008373506e7
+const x_rect_min = -2.110526032083613e7
+const y_rect_min = -1.495961776648254e7
 
 # see https://www.youtube.com/watch?v=FWJOdMh8JQo&t=341s
 function _compute_trans_matrix()
-    θ_rotation = 60 * π / 180
-    rotation_matrix = @SMatrix [cos(θ_rotation) -sin(θ_rotation); sin(θ_rotation) cos(θ_rotation)]
-    θ_skew = 30 * π / 180
-    skew_matrix = @SMatrix [1 tan(θ_skew); 0 1]
-    skew_matrix * rotation_matrix
+    θ_rotation = π / 3
+    #Use that cos(π/3) = 0.5, sin(π/3) = sqrt(3)/2
+    sqrt3 = sqrt(BigFloat(3))
+
+    rotation_matrix = @SMatrix [0.5 -sqrt3/2; sqrt3/2 0.5]
+    θ_skew = π / 6
+    isqrt3 = 1 / sqrt(BigFloat(3))
+    #Use that tan(π/6) = 1/sqrt(3)
+    skew_matrix = @SMatrix [1 isqrt3; 0 1]
+    Float64.(skew_matrix * rotation_matrix)
 end
 const trans_matrix = _compute_trans_matrix()
 const itrans_matrix = inv(trans_matrix)
@@ -70,29 +79,6 @@ function (r::RotatedISEAToIndices)(x_offset, y_offset)
 end
 (r::RotatedISEAToIndices)(t::Tuple) = r(t...)
 
-
-
-# use icosahedron vertices to calculate the extent
-function compute_rectangles()
-    corner1 = LatLonToISEA()(58.2825256, -168.75)
-    corner2 = LatLonToISEA()(0.0 + epsilon, -137.0325256 - epsilon)
-    x_rect_min, y_rect_min = trans_matrix * @SVector [corner1[1], corner1[2]]
-    x_rect_max, y_rect_max = trans_matrix * @SVector [corner2[1], corner2[2]]
-    rect_width = x_rect_max - x_rect_min
-    rect_height = y_rect_max - y_rect_min
-    x_rect_min, rect_width, y_rect_min, rect_height
-end
-
-const x_rect_min, rect_width, y_rect_min, rect_height = compute_rectangles()
-const rect_borders = @SVector [
-    (-2.1104759358105145e7, -5.75584346120373e6, -1.6283372582998954e7, -8.307844429392608e6)
-    (-1.3430301409731183e7, 1.9186144871702371e6, -9.637109526020896e6, -1.6615688858253537e6)
-    (-5.755843461357219e6, 9.5930724355442e6, -2.9908464690428358e6, 4.984706657741904e6)
-    (1.9186144870167463e6, 1.726753038391816e7, 3.6554165879352223e6, 1.1630982201309163e7)
-    (9.593072435390707e6, 2.4941988332292132e7, 1.0301679644913286e7, 1.8277257744876422e7)
-]
-
-#const x_rect_min, x_rect_max, rect_width, y_rect_min, y_rect_max, rect_height = compute_rectangles()
 
 
 #
