@@ -11,6 +11,7 @@ using CoordinateTransformations
 include("types.jl")
 include("cells.jl")
 include("arrays.jl")
+include("native.jl")
 
 const transformations = Channel{Proj.Transformation}(Inf)
 const inv_transformations = Channel{Proj.Transformation}(Inf)
