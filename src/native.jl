@@ -1,7 +1,7 @@
 module NativeISEA
-using StaticArrays: SVector, @SVector
+using StaticArrays: SVector, @SVector, @SMatrix
 using Rotations: RotX, RotZ
-using GeometryOps.UnitSpherical: UnitSphereFromGeographic, GeographicFromUnitSphere, UnitSphericalPoint, slerp
+using GeometryOps.UnitSpherical: spherical_distance, UnitSphereFromGeographic, GeographicFromUnitSphere, UnitSphericalPoint, slerp
 const USP = UnitSphericalPoint
 using LinearAlgebra: cross, dot,norm, normalize
 
@@ -13,6 +13,7 @@ const ITRIANGLE_HEIGHT_SIDE = 1.044436448670983612734708092275980120462245664528
 const MAX_TRIANGLE_HEIGHT = Float64(sind(BigFloat(60)))
 const TRIANGLE_AREA = 0.6283185307179586
 const TRIANGLE_PRODUCT = 0.7608452130361227
+const DISTANCE_THRESHOLD = 0.6408518201709885
 
 function compute_vertices()
     vertices = Vector{SVector{3,BigFloat}}(undef, 12)
@@ -52,27 +53,40 @@ function A(a, b, c)
 end
 triple_product(a, b, c) = dot(a, cross(b, c))
 
+
+
 struct ISEATriangle{T}
-    a::UnitSphericalPoint{T}
-    b::UnitSphericalPoint{T}
-    c::UnitSphericalPoint{T}
+    A::UnitSphericalPoint{T}
+    B::UnitSphericalPoint{T}
+    C::UnitSphericalPoint{T}
     kind::Symbol
-    #And store normal and offset of the corresponding plane
-    # normal::UnitSphericalPoint{T}
-    # offset::T
+    #And store midpoints for faster computations
+    M::UnitSphericalPoint{T}
+    AB::UnitSphericalPoint{T}
+    BC::UnitSphericalPoint{T}
+    CA::UnitSphericalPoint{T}
+    triangles::Vector{@NamedTuple{A::UnitSphericalPoint{T},B::UnitSphericalPoint{T},C::UnitSphericalPoint{T}}}
 end
-function ISEATriangle(a, b, c, kind, T)
-    # normal = -cross(a-b,c-b)
-    # normal = normal/norm(normal)
-    # offset = -dot(normal,a)
-    return ISEATriangle(USP{T}(a),USP{T}(b),USP{T}(c),kind)
+function ISEATriangle(A, B, C, kind, T)
+    AB = USP{T}(slerp(A, B, 0.5))
+    BC = USP{T}(slerp(B, C, 0.5))
+    CA = USP{T}(slerp(C, A, 0.5))
+    M = USP{T}((A + B + C) |> normalize)
+    A = USP{T}(A)
+    B = USP{T}(B)
+    C = USP{T}(C)
+    triangles = [
+        (A=A, B=M, C=CA),(A=A,B=M,C=CA),(A=C,B=M,C=BC),(A=C,B=CA,C=M),
+        (A=B,B=M,C=AB),(A=A,B=AB,C=M),(A=B,B=BC,C=M), (A=B,B=BC,C=M)
+    ]
+    return ISEATriangle(A,B,C,kind,M,AB,BC,CA,triangles)
 end
 function Base.show(io::IO, ::MIME"text/plain", tri::ISEATriangle)
-    corners = GeographicFromUnitSphere().((tri.a, tri.b, tri.c))
+    corners = GeographicFromUnitSphere().((tri.A, tri.B, tri.C))
     println(io, "$(tri.kind) triangle with corner coordinates $corners")
 end
-_base(t::ISEATriangle) = t.c-t.b
-_height(t::ISEATriangle) = t.a-(t.b+t.c)/2
+_base(t::ISEATriangle) = t.C-t.B
+_height(t::ISEATriangle) = t.A-(t.B+t.C)/2
 
 
 #Make a type for the neighboring triangles
@@ -135,105 +149,153 @@ Base.inv(isea::InvISEA20) = ISEA20(isea.isea)
 ISEA20(args...;kwargs...) = ISEA20(ISEA(args...;kwargs...))
 InvISEA20(args...;kwargs...) = InvISEA20(ISEA(args...;kwargs...))
 
+function to_single_plane((itri, x, y))
+    if 1 <= itri <= 5 #North triangles
+        return x + itri - 1, y
+    elseif 6 <= itri <= 10 # South triangles
+        return 1.5 + mod(4 - itri, 5) - x, -y - MAX_TRIANGLE_HEIGHT
+    elseif 11 <= itri <= 15 # North tip equator
+        return x + mod(itri + 3, 5) + 0.5, y - MAX_TRIANGLE_HEIGHT
+    else
+        return 1 + (itri - 16) - x, -y
+    end
+end
+
+
+function fast_triangle_distance(t::ISEATriangle, p)
+    if norm(t.M-p) > DISTANCE_THRESHOLD
+        return Inf
+    else
+        return triangle_distance(t.A,t.B,t.C,p)
+    end
+end
+
 (isea::ISEA20)(latlon::NTuple{2}) = isea(UnitSphericalPoint(latlon))
 function _transform_isea(isea::ISEA,p::UnitSphericalPoint)
     grid = isea
-    r, stable = transform_point(p, grid.triangles[1])
-    d, _ = triangle_distance(r)
-    stable && iszero(d) && return (1, r...)
-    current_min = d, (1, r...)
+    t = isea.triangles[1]
+    d = fast_triangle_distance(t,p)
+    iszero(d) && return (1, first(transform_point(p,t))...)
+    current_min = d, 1
     for i in 2:20
-        r,stable = transform_point(p,grid.triangles[i])
-        d, _ = triangle_distance(r)
-        stable && iszero(d) && return (i, r...)
+        t = grid.triangles[i]
+        d = fast_triangle_distance(t,p)
+        iszero(d) && return (i, first(transform_point(p,t))...)
         if d < first(current_min)
-            current_min = d, (i, r...)
+            current_min = d, i
         end
     end
     #Nothing was found, so lets use the triangle with the smallest distance
-    return last(current_min)
+    return (last(current_min), first(transform_point(p,grid.triangles[last(current_min)]))...)
 end
 
 (isea::ISEA20)(p::UnitSphericalPoint) = _transform_isea(isea.isea,p)
 
-# function transform_point(p::UnitSphericalPoint,tri::ISEATriangle)
-#     t = -tri.offset/dot(p,tri.normal)
-#     t < 0 && return (Inf,Inf)
-#     pointonsurface = p*t
-#     nbase=_base(tri)*ITRIANGLE_SIDE_SQ
-#     nheight = _height(tri) * ITRIANGLE_HEIGHT_SIDE
-#     x1 = dot(pointonsurface-tri.b,nbase)
-#     x2 = dot(pointonsurface-tri.b,nheight)
-#     x1,x2
-# end
-
 @inline function transform_bary(v0,v1,v2,v)
-
-    p1 = TRIANGLE_PRODUCT*v - triple_product(v,v1,v2)*v0
+    #trip = triple_product(v0,v1,v2)
+    #p1 = trip*v - triple_product(v,v1,v2)*v0
+    p1 = cross(cross(v0,v),cross(v1,v2))
     all(iszero, p1) || (p1 = normalize(p1))
-    #dot(p1,v1) < 0 && (p1 = -p1)
+    pstable =  dot(p1,v0) < 0
     h = sqrt((1 - dot(v0, v)) / (1 - dot(v0, p1)))
     a_part, stable = A(v0,v1,p1)
-    β2 = h * a_part / TRIANGLE_AREA
+    a_whole, wstable = A(v0,v1,v2)
+    β2 = h * a_part / a_whole
     β0 = 1 - h
     β1 = h-β2
-    β0, β1, β2, stable
+    @SVector([β0, β1, β2]), (pstable && wstable && stable)
 end
-function bary_to_xy(β0, _, β2)
-    y = 0.5 * sqrt(3) * β0
-    x = 0.5 * β0 + β2
-    x, y
+function bary_to_xy(β,rect)
+    [rect.A rect.B rect.C] * β
+end
+
+"Coordinates of the triangles in the 2d plane"
+function _compute_planecoords()
+    M = @SVector([0.5, sqrt(3) / 6])
+    A = @SVector([0.5, sqrt(3) / 2])
+    B = @SVector([0.0, 0.0])
+    C = @SVector([1.0, 0.0])
+    AB = @SVector([0.25, sqrt(3) / 4])
+    BC = @SVector([0.5, 0.0])
+    CA = @SVector([0.75, sqrt(3) / 4])
+    triangles = (
+        (A=A,B=M,C=CA),(A=A,B=M,C=CA),(A=C,B=M,C=BC),(A=C,B=CA,C=M),
+        (A=B,B=M,C=AB),(A=A,B=AB,C=M),(A=B,B=BC,C=M),(A=B,B=BC,C=M)
+    )
+    (;M,A,B,C,AB,BC,CA,triangles)
+end
+const PlaneCoordinates = _compute_planecoords()
+
+"""
+   Determines the rectangular sub-triangle from a given UnitSphericalPoint
+"""
+function find_subtriangle(t, v)
+    b_c = dist_rhs(t.A, t.BC, v) < 0
+    c_a = dist_rhs(t.B, t.CA, v) < 0
+    a_b = dist_rhs(t.C, t.AB, v) < 0
+    ((b_c << 2) | (c_a << 1) | a_b) + 1
 end
 
 function transform_point(v, t)
-    β0, β1, β2, stable = transform_bary(t.a,t.b,t.c,v)
-    bary_to_xy(β0, β1, β2), stable
+    itri = find_subtriangle(t,v)
+    trirect = t.triangles[itri]
+    planerect = PlaneCoordinates.triangles[itri]   
+    β, stable = transform_bary(trirect..., v)
+    bary_to_xy(β,planerect),stable, itri
 end
 
-#intriangle((x1, x2)) = (0 <= x1 <= 1) && (0 <= x2 <= MAX_TRIANGLE_HEIGHT * (1 - 2 * abs(x1 - 0.5)))
-intriangle((x1, x2)) = iszero(first(triangle_distance((x1, x2))))
 function intriangle(p,tri::ISEATriangle) 
-    (x,y),stable = transform_point(UnitSphericalPoint(p),tri)
-    stable && intriangle((x,y))
+    iszero(triangle_distance(tri.A,tri.B,tri.C,p))
 end
 
-function triangle_distance((x1, x2))
-    downdist = max(-x2, zero(x2))
-    x1offset = x1 - 0.5
-    leftdist = max(x2 - MAX_TRIANGLE_HEIGHT * (1 + 2 * (x1offset)), zero(x2))
-    rightdist = max(x2 - MAX_TRIANGLE_HEIGHT * (1 - 2 * (x1offset)), zero(x2))
-    findmax((leftdist, rightdist, downdist))
+"Projected signed distance of a point v is to the right of the line between a and b"
+dist_rhs(a::UnitSphericalPoint,b::UnitSphericalPoint,v::UnitSphericalPoint) = dot(cross(a,b),v)
+
+function dist_rhs(a::SVector{2},b::SVector{2},v::SVector{2})
+    c = b-a
+    c[1]*(v[2]-a[2]) - c[2]*(v[1]-a[1])
+end
+
+
+function triangle_distance(a,b,c,v)
+    d_ab = dist_rhs(b,a,v)
+    d_bc = dist_rhs(c,b,v)
+    d_ca = dist_rhs(a,c,v)
+    max(d_ab,d_bc,d_ca,0.0)
 end
 
 
 # function itransform_point(x1,x2,tri::ISEATriangle)
 #     base=_base(tri)
 #     height=_height(tri)
-#     pointonsurface = tri.b + x1 * base + x2 * height / MAX_TRIANGLE_HEIGHT
+#     pointonsurface = tri.B + x1 * base + x2 * height / MAX_TRIANGLE_HEIGHT
 #     p = pointonsurface/norm(pointonsurface)
 #     return GeographicFromUnitSphere()(p)
 # end
 function itransform_point(x, y, t)
-    β0 = 2 * y / sqrt(3)
-    β2 = x - 0.5 * β0
+    itri = find_subtriangle(PlaneCoordinates,@SVector([x,y]))
+    planetri = PlaneCoordinates.triangles[itri]
+    trimat = vcat(@SMatrix([1.0 1.0 1.0]),[planetri.A planetri.B planetri.C])
+    β = trimat \ @SVector([1.0,x,y])
+    β0, _, β2 = β
     h = 1 - β0
-    iszero(h) && return t.a
+    t = t.triangles[itri]
+    iszero(h) && return t.A
     q = if β2 != 0.0
-        a = β2 / h * TRIANGLE_AREA
+        a = β2 / h * first(A(t.A,t.B,t.C))
         S = sin(a)
         C = 1 - cos(a)
         #@show a,S,C
-        f = S * TRIANGLE_PRODUCT + C * (dot(t.a, t.b) * dot(t.b, t.c) - dot(t.c, t.a))
-        g = C * sqrt(1 - dot(t.b, t.c)^2) * (1 + dot(t.a, t.b))
+        f = S * triple_product(t.A,t.B,t.C) + C * (dot(t.A, t.B) * dot(t.B, t.C) - dot(t.C, t.A))
+        g = C * sqrt(1 - dot(t.B, t.C)^2) * (1 + dot(t.A, t.B))
         #@show f,g
-        2 / acos(dot(t.b, t.c)) * atan(g / f)
+        2 / acos(dot(t.B, t.C)) * atan(g / f)
     else
         0.0
     end
-    #@show q
-    p = slerp(t.b, t.c, q)
-    T = acos(1 + h^2 * (dot(t.a, p) - 1)) / acos(dot(t.a, p))
-    slerp(t.a, p, T)
+    p = slerp(t.B, t.C, q)
+    T = acos(1 + h^2 * (dot(t.A, p) - 1)) / acos(dot(t.A, p))
+    slerp(t.A, p, T)
 end
 (isea::InvISEA20)((n, x1, x2)) = itransform_point(x1, x2, isea.isea.triangles[n])
 
@@ -294,8 +356,5 @@ function (isea::ISEA5)(p::UnitSphericalPoint)
     i,x1,x2
 end
 (isea::ISEA5)(latlon::NTuple{2}) = isea(UnitSphericalPoint(latlon))
-
-
-
 
 end
